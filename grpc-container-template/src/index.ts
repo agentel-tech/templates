@@ -5,8 +5,21 @@ const GRPC_PORT = 50051;
 const LOCAL_GRPC_PORT = 8788;
 const CONTAINER_CONNECT_ATTEMPTS = 60;
 const CONTAINER_CONNECT_RETRY_MS = 250;
-const CONTAINER_STARTUP_GRACE_MS = 3_000;
-const CONTAINER_STABILITY_WINDOW_MS = 250;
+const CONTAINER_PROBE_TIMEOUT_MS = 1_000;
+// A dedicated HTTP/2 connection verifies gRPC readiness without consuming or
+// injecting bytes into the client's independent connection.
+const HTTP2_PREFACE = new Uint8Array([
+	...new TextEncoder().encode("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"),
+	0,
+	0,
+	0,
+	4,
+	0,
+	0,
+	0,
+	0,
+	0, // Empty client SETTINGS frame.
+]);
 
 const SOCKET_OPTIONS: SocketOptions = {
 	// A gRPC client half-closes its request stream before the server finishes
@@ -36,64 +49,103 @@ async function bridgeSockets(left: Socket, right: Socket): Promise<void> {
 export class GrpcContainer extends DurableObject<Env> {
 	private starting: Promise<void> | undefined;
 
-	private async openGrpcSocket(): Promise<Socket> {
-		const container = this.ctx.container;
-		if (!container) {
-			throw new Error("Container binding is unavailable");
+	private async probeGrpcPort(container: Container): Promise<void> {
+		const probe = container
+			.getTcpPort(GRPC_PORT)
+			.connect(`10.0.0.1:${GRPC_PORT}`, SOCKET_OPTIONS);
+		// Local proxy sockets can report opened before the process is listening.
+		// Observe the protocol response instead of treating that as readiness.
+		void probe.closed.catch(() => {});
+		let timeout: ReturnType<typeof setTimeout> | undefined;
+		try {
+			await Promise.race([
+				(async () => {
+					await probe.opened;
+					const writer = probe.writable.getWriter();
+					try {
+						await writer.write(HTTP2_PREFACE);
+					} finally {
+						writer.releaseLock();
+					}
+					const reader = probe.readable.getReader();
+					try {
+						const header = new Uint8Array(9);
+						let received = 0;
+						while (received < header.length) {
+							const { value, done } = await reader.read();
+							if (done)
+								throw new Error("Container closed before HTTP/2 SETTINGS");
+							const part = value.subarray(0, header.length - received);
+							header.set(part, received);
+							received += part.length;
+						}
+						if (
+							header[3] !== 4 ||
+							header[4] !== 0 ||
+							header.slice(5).some((byte) => byte !== 0)
+						) {
+							throw new Error("Container did not send initial HTTP/2 SETTINGS");
+						}
+					} finally {
+						reader.releaseLock();
+					}
+				})(),
+				new Promise<never>((_, reject) => {
+					timeout = setTimeout(
+						() => reject(new Error("Container HTTP/2 probe timed out")),
+						CONTAINER_PROBE_TIMEOUT_MS,
+					);
+				}),
+			]);
+		} finally {
+			if (timeout !== undefined) clearTimeout(timeout);
+			await probe.close().catch(() => {});
 		}
+	}
 
-		if (!container.running && !this.starting) {
-			container.start({
-				enableInternet: false,
-				env: { GRPC_PORT: String(GRPC_PORT) },
-			});
-			this.starting = scheduler.wait(CONTAINER_STARTUP_GRACE_MS).finally(() => {
-				this.starting = undefined;
-			});
-		}
-		await this.starting;
-
+	private async waitForGrpcPort(container: Container): Promise<void> {
 		let lastError: unknown;
-
 		for (let attempt = 1; attempt <= CONTAINER_CONNECT_ATTEMPTS; attempt += 1) {
-			let candidate: Socket | undefined;
-
 			try {
-				candidate = container
-					.getTcpPort(GRPC_PORT)
-					.connect(`10.0.0.1:${GRPC_PORT}`, SOCKET_OPTIONS);
-				await candidate.opened;
-
-				// A connection can open and immediately close while the process inside
-				// the Container is still binding its port. Give it a short stability
-				// window before accepting it.
-				const closedBeforeReady = await Promise.race([
-					candidate.closed.then(
-						() => true,
-						() => true,
-					),
-					scheduler.wait(CONTAINER_STABILITY_WINDOW_MS).then(() => false),
-				]);
-
-				if (!closedBeforeReady) {
-					return candidate;
-				}
-
-				lastError = new Error("Container port closed before becoming ready");
+				await this.probeGrpcPort(container);
+				return;
 			} catch (error) {
 				lastError = error;
 			}
-
-			await candidate?.close().catch(() => {});
-
 			if (attempt < CONTAINER_CONNECT_ATTEMPTS) {
 				await scheduler.wait(CONTAINER_CONNECT_RETRY_MS);
 			}
 		}
-
 		throw new Error("Container gRPC port did not become ready", {
 			cause: lastError,
 		});
+	}
+
+	private async openGrpcSocket(): Promise<Socket> {
+		const container = this.ctx.container;
+		if (!container) throw new Error("Container binding is unavailable");
+		if (!this.starting) {
+			if (!container.running) {
+				container.start({
+					enableInternet: false,
+					env: { GRPC_PORT: String(GRPC_PORT) },
+				});
+			}
+			this.starting = this.waitForGrpcPort(container).finally(() => {
+				this.starting = undefined;
+			});
+		}
+		await this.starting;
+		const upstream = container
+			.getTcpPort(GRPC_PORT)
+			.connect(`10.0.0.1:${GRPC_PORT}`, SOCKET_OPTIONS);
+		try {
+			await upstream.opened;
+			return upstream;
+		} catch (error) {
+			await upstream.close().catch(() => {});
+			throw error;
+		}
 	}
 
 	async connect(socket: Socket): Promise<void> {

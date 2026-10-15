@@ -45,19 +45,26 @@ function createEnv(socket: Socket) {
 	return { env, connect, getByName };
 }
 
+const SETTINGS = new Uint8Array([0, 0, 0, 4, 0, 0, 0, 0, 0]);
+
 function createContainer(socket: Socket, running = true) {
+	const probe = createSocket([SETTINGS]);
+	const connect = vi
+		.fn()
+		.mockReturnValueOnce(probe.socket)
+		.mockReturnValue(socket);
 	const container = {
 		running,
 		start: vi.fn(() => {
 			container.running = true;
 		}),
 		getTcpPort: vi.fn().mockReturnValue({
-			connect: vi.fn().mockReturnValue(socket),
+			connect,
 		}),
 	};
 	const durableObject: GrpcContainer = Object.create(GrpcContainer.prototype);
 	Object.defineProperty(durableObject, "ctx", { value: { container } });
-	return { durableObject, container };
+	return { durableObject, container, connect, probe };
 }
 
 afterEach(() => {
@@ -159,7 +166,7 @@ describe("gRPC Container Worker", () => {
 		const incoming = createSocket();
 		const upstream = createSocket();
 		const { env, connect } = createEnv(upstream.socket);
-		connect.mockImplementation(() => ({
+		connect.mockReset().mockImplementation(() => ({
 			...upstream.socket,
 			opened: Promise.reject(new Error("upstream unavailable")),
 		}));
@@ -186,110 +193,140 @@ describe("gRPC Container Worker", () => {
 });
 
 describe("gRPC Container lifecycle", () => {
-	it("shares the startup wait across concurrent connections", async () => {
-		let finishStartup: () => void;
-		const startup = new Promise<void>((resolve) => {
-			finishStartup = resolve;
-		});
-		vi.spyOn(scheduler, "wait").mockImplementation((milliseconds) =>
-			milliseconds === 3_000 ? startup : Promise.resolve(),
-		);
-		const upstream = createSocket();
-		const nextUpstream = createSocket();
-		const { durableObject, container } = createContainer(
-			upstream.socket,
+	it("shares protocol readiness across concurrent connections and starts only once", async () => {
+		const probe = createSocket([], true);
+		const firstUpstream = createSocket();
+		const secondUpstream = createSocket();
+		const { durableObject, container, connect } = createContainer(
+			firstUpstream.socket,
 			false,
 		);
-		container.getTcpPort.mockReturnValue({
-			connect: vi
-				.fn()
-				.mockReturnValueOnce(upstream.socket)
-				.mockReturnValueOnce(nextUpstream.socket),
-		});
-
+		connect
+			.mockReset()
+			.mockReturnValueOnce(probe.socket)
+			.mockReturnValueOnce(firstUpstream.socket)
+			.mockReturnValueOnce(secondUpstream.socket);
 		const first = durableObject.connect(createSocket().socket);
 		const second = durableObject.connect(createSocket().socket);
+		await vi.waitFor(() => expect(probe.written).toHaveLength(1));
 		expect(container.start).toHaveBeenCalledOnce();
-		expect(container.getTcpPort).not.toHaveBeenCalled();
-		finishStartup!();
+		expect(connect).toHaveBeenCalledTimes(1);
+		probe.controller.enqueue(SETTINGS);
+		probe.controller.close();
 		await Promise.all([first, second]);
-
-		expect(container.getTcpPort).toHaveBeenCalledTimes(2);
-		expect(upstream.socket.close).toHaveBeenCalledOnce();
-		expect(nextUpstream.socket.close).toHaveBeenCalledOnce();
+		expect(connect).toHaveBeenCalledTimes(3);
+		expect(probe.socket.close).toHaveBeenCalledOnce();
 	});
 
-	it("forwards data to an already-running Container", async () => {
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+	it("keeps probe bytes out of the client stream and forwards binary application data", async () => {
 		const request = new Uint8Array([0, 255]);
 		const response = new Uint8Array([128, 1]);
 		const incoming = createSocket([request]);
 		const upstream = createSocket([response]);
-		const { durableObject, container } = createContainer(upstream.socket);
-
+		const { durableObject, container, probe } = createContainer(
+			upstream.socket,
+		);
 		await durableObject.connect(incoming.socket);
-
 		expect(container.start).not.toHaveBeenCalled();
 		expect(container.getTcpPort).toHaveBeenCalledWith(50051);
+		expect(new TextDecoder().decode(probe.written[0].subarray(0, 24))).toBe(
+			"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n",
+		);
 		expect(upstream.written).toEqual([request]);
 		expect(incoming.written).toEqual([response]);
-		expect(incoming.socket.close).toHaveBeenCalledOnce();
-		expect(upstream.socket.close).toHaveBeenCalledOnce();
+		expect(probe.socket.close).toHaveBeenCalledOnce();
 	});
 
-	it("restarts a stopped Container on the same Durable Object", async () => {
+	it("accepts a fragmented SETTINGS header without consuming the application stream", async () => {
+		const upstream = createSocket();
+		const { durableObject, connect } = createContainer(upstream.socket);
+		const probe = createSocket([SETTINGS.subarray(0, 3), SETTINGS.subarray(3)]);
+		connect
+			.mockReset()
+			.mockReturnValueOnce(probe.socket)
+			.mockReturnValue(upstream.socket);
+		await durableObject.connect(createSocket().socket);
+		expect(connect).toHaveBeenCalledTimes(2);
+	});
+
+	it("retries opened sockets whose protocol response closes before readiness", async () => {
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const upstream = createSocket();
-		const { durableObject, container } = createContainer(
+		const { durableObject, connect, probe } = createContainer(upstream.socket);
+		const early = createSocket();
+		connect
+			.mockReset()
+			.mockReturnValueOnce(early.socket)
+			.mockReturnValueOnce(probe.socket)
+			.mockReturnValue(upstream.socket);
+		await durableObject.connect(createSocket().socket);
+		expect(connect).toHaveBeenCalledTimes(3);
+		expect(early.socket.close).toHaveBeenCalledOnce();
+	});
+
+	it("rejects non-SETTINGS and SETTINGS ACK responses before trying a fresh probe", async () => {
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const upstream = createSocket();
+		const { durableObject, connect, probe } = createContainer(upstream.socket);
+		const wrong = createSocket([new Uint8Array([0, 0, 0, 0, 0, 0, 0, 0, 0])]);
+		const ack = createSocket([new Uint8Array([0, 0, 0, 4, 1, 0, 0, 0, 0])]);
+		connect
+			.mockReset()
+			.mockReturnValueOnce(wrong.socket)
+			.mockReturnValueOnce(ack.socket)
+			.mockReturnValueOnce(probe.socket)
+			.mockReturnValue(upstream.socket);
+		await durableObject.connect(createSocket().socket);
+		expect(connect).toHaveBeenCalledTimes(4);
+		expect(wrong.socket.close).toHaveBeenCalledOnce();
+		expect(ack.socket.close).toHaveBeenCalledOnce();
+	});
+
+	it("bounds a hung probe and retries without waiting forever", async () => {
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const upstream = createSocket();
+		const { durableObject, connect, probe } = createContainer(upstream.socket);
+		const hung = createSocket([], true);
+		connect
+			.mockReset()
+			.mockReturnValueOnce(hung.socket)
+			.mockReturnValueOnce(probe.socket)
+			.mockReturnValue(upstream.socket);
+		await durableObject.connect(createSocket().socket);
+		expect(connect).toHaveBeenCalledTimes(3);
+		expect(hung.socket.close).toHaveBeenCalledOnce();
+	});
+
+	it("restarts a stopped Container and verifies readiness again", async () => {
+		const upstream = createSocket();
+		const { durableObject, container, connect } = createContainer(
 			upstream.socket,
 			false,
 		);
-
 		await durableObject.connect(createSocket().socket);
 		container.running = false;
-		const nextUpstream = createSocket();
-		container.getTcpPort.mockReturnValue({
-			connect: vi.fn().mockReturnValue(nextUpstream.socket),
-		});
+		const nextProbe = createSocket([SETTINGS]);
+		connect
+			.mockReturnValueOnce(nextProbe.socket)
+			.mockReturnValue(upstream.socket);
 		await durableObject.connect(createSocket().socket);
-
 		expect(container.start).toHaveBeenCalledTimes(2);
 		expect(container.start).toHaveBeenCalledWith({
 			enableInternet: false,
 			env: { GRPC_PORT: "50051" },
 		});
+		expect(nextProbe.socket.close).toHaveBeenCalledOnce();
 	});
 
-	it("retries and closes a port that closes before becoming ready", async () => {
-		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
-		const incoming = createSocket();
-		const early = createSocket();
-		const upstream = createSocket();
-		const { durableObject, container } = createContainer(upstream.socket);
-		const connect = vi
-			.fn()
-			.mockReturnValueOnce({ ...early.socket, closed: Promise.resolve() })
-			.mockReturnValue(upstream.socket);
-		container.getTcpPort.mockReturnValue({ connect });
-
-		await durableObject.connect(incoming.socket);
-
-		expect(connect).toHaveBeenCalledTimes(2);
-		expect(early.socket.close).toHaveBeenCalledOnce();
-		expect(upstream.socket.close).toHaveBeenCalledOnce();
-	});
-
-	it("bounds startup retries and closes the client when the port is unavailable", async () => {
+	it("bounds readiness retries and closes the client when all probes fail", async () => {
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
 		const incoming = createSocket();
 		const upstream = createSocket();
-		const { durableObject, container } = createContainer(upstream.socket);
-		const connect = vi.fn(() => ({
+		const { durableObject, connect } = createContainer(upstream.socket);
+		connect.mockReset().mockImplementation(() => ({
 			...upstream.socket,
 			opened: Promise.reject(new Error("connection refused")),
 		}));
-		container.getTcpPort.mockReturnValue({ connect });
-
 		await expect(durableObject.connect(incoming.socket)).rejects.toThrow(
 			"Container gRPC port did not become ready",
 		);
@@ -298,11 +335,28 @@ describe("gRPC Container lifecycle", () => {
 		expect(incoming.socket.close).toHaveBeenCalledOnce();
 	});
 
+	it("closes an application socket that fails after a successful probe", async () => {
+		const incoming = createSocket();
+		const upstream = createSocket();
+		const { durableObject, connect, probe } = createContainer(upstream.socket);
+		connect
+			.mockReset()
+			.mockReturnValueOnce(probe.socket)
+			.mockImplementation(() => ({
+				...upstream.socket,
+				opened: Promise.reject(new Error("application connect failed")),
+			}));
+		await expect(durableObject.connect(incoming.socket)).rejects.toThrow(
+			"application connect failed",
+		);
+		expect(upstream.socket.close).toHaveBeenCalledOnce();
+		expect(incoming.socket.close).toHaveBeenCalledOnce();
+	});
+
 	it("closes the client when no Container is configured", async () => {
 		const incoming = createSocket();
 		const durableObject: GrpcContainer = Object.create(GrpcContainer.prototype);
 		Object.defineProperty(durableObject, "ctx", { value: {} });
-
 		await expect(durableObject.connect(incoming.socket)).rejects.toThrow(
 			"Container binding is unavailable",
 		);
