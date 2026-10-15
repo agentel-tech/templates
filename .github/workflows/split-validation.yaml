@@ -46,6 +46,9 @@ jobs:
         run: pnpm -w check
       - name: Run default concurrency unit tests
         run: pnpm -w test
+      - name: Verify protected template readiness
+        if: matrix.candidate == 'template-only'
+        run: pnpm exec vitest run cli/test/template-readiness.test.ts
       - name: Install browser
         run: pnpm exec playwright install --with-deps chromium
       - name: Run all E2E with default functional configuration
