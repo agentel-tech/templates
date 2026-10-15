@@ -1,0 +1,50 @@
+name: Native Ubuntu candidate validation
+
+# Prepared locally only. Place in a user-owned templates checkout containing
+# the exact reviewed candidate; do not use this to modify existing upstream PRs.
+on:
+  push:
+    branches: [ci/native-ubuntu-agentel-gallery-20261016]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-defaults:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.3"
+          cache: pnpm
+      - name: Verify native architecture
+        run: |
+          test "$(uname -m)" = x86_64
+          node --version
+          pnpm --version
+          docker info --format '{{.OSType}} {{.Architecture}}'
+      - name: Install frozen dependencies
+        run: pnpm install --frozen-lockfile --child-concurrency=10
+      - name: Run checks
+        run: pnpm -w check
+      - name: Run default concurrency unit tests
+        run: pnpm -w test
+      - name: Install browser
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run all E2E with default functional configuration
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_FILE: e2e-default-report.json
+        run: pnpm test:e2e --reporter=line,json
+      - name: Retain readback
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-ubuntu-default-results
+          path: |
+            e2e-default-report.json
+            test-results/
+            .turbo/runs/

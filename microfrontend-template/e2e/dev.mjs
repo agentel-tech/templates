@@ -1,3 +1,4 @@
+import { waitForWorker } from "./readiness.mjs";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:net";
@@ -18,23 +19,6 @@ function availablePort() {
 			server.close((error) => (error ? reject(error) : resolve(address.port)));
 		});
 	});
-}
-
-async function waitForWorker(child, port) {
-	const deadline = Date.now() + 15_000;
-	while (Date.now() < deadline) {
-		if (child.exitCode !== null) {
-			throw new Error(`Stub Worker exited with code ${child.exitCode}`);
-		}
-		try {
-			const response = await fetch(`http://localhost:${port}`);
-			if (response.ok) return;
-		} catch {
-			// Worker is still starting.
-		}
-		await new Promise((resolve) => setTimeout(resolve, 100));
-	}
-	throw new Error(`Stub Worker on port ${port} did not start`);
 }
 
 const pnpm = process.platform === "win32" ? "pnpm.cmd" : "pnpm";

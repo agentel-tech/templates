@@ -56,6 +56,7 @@ export interface Template {
 	devCommand: string;
 	devScript: "dev" | "e2e:dev";
 	healthCheckPath?: string;
+	healthCheckStatus?: number;
 }
 
 type TemplatePackageJson = {
@@ -63,6 +64,7 @@ type TemplatePackageJson = {
 	cloudflare?: {
 		publish?: boolean;
 		healthCheckPath?: string;
+		healthCheckStatus?: number;
 	};
 };
 
@@ -148,6 +150,7 @@ export class TemplateServerManager {
 			devCommand: e2eDevCommand ?? scripts.dev,
 			devScript: e2eDevCommand ? "e2e:dev" : "dev",
 			healthCheckPath: packageJson.cloudflare?.healthCheckPath,
+			healthCheckStatus: packageJson.cloudflare?.healthCheckStatus,
 		};
 	}
 
@@ -222,7 +225,13 @@ export class TemplateServerManager {
 			? `${baseUrl}${template.healthCheckPath}`
 			: baseUrl;
 		try {
-			await this.waitForServer(healthCheckUrl, server, logs, 30000);
+			await this.waitForServer(
+				healthCheckUrl,
+				server,
+				logs,
+				process.env.TEMPLATES_SLOW_LOCAL_TESTS === "1" ? 300000 : 30000,
+				template.healthCheckStatus,
+			);
 		} catch (error) {
 			await this.stopServer(templateName);
 			throw error;
@@ -334,31 +343,50 @@ export class TemplateServerManager {
 		server: ChildProcess,
 		logs: string[],
 		timeout: number,
+		expectedStatus?: number,
 	): Promise<void> {
 		const start = Date.now();
+		let lastStatus: number | undefined;
+		const requestTimeout =
+			process.env.TEMPLATES_SLOW_LOCAL_TESTS === "1" ? 30000 : 2000;
 
 		while (Date.now() - start < timeout) {
-			if (server.exitCode !== null) {
+			if (server.exitCode !== null || server.signalCode !== null) {
 				throw new Error(
-					`Server process exited with code ${server.exitCode}.\n${logs.join("")}`,
+					`Server process exited with ${server.signalCode ?? server.exitCode}.\n${logs.join("")}`,
 				);
 			}
 			try {
 				const response = await fetch(url, {
-					signal: AbortSignal.timeout(2000),
+					signal: AbortSignal.timeout(
+						Math.min(
+							requestTimeout,
+							Math.max(1, timeout - (Date.now() - start)),
+						),
+					),
 				});
-				if (response.ok) {
+				lastStatus = response.status;
+				if (
+					expectedStatus === undefined
+						? response.ok
+						: response.status === expectedStatus
+				) {
 					return;
 				}
 			} catch (error) {
 				// Server not ready yet
 			}
 
-			await new Promise((resolve) => setTimeout(resolve, 500));
+			await new Promise((resolve) =>
+				setTimeout(
+					resolve,
+					Math.min(500, Math.max(0, timeout - (Date.now() - start))),
+				),
+			);
 		}
 
 		throw new Error(
-			`Server at ${url} did not become ready within ${timeout}ms.\n${logs.join("")}`,
+			`Server at ${url} did not become ready within ${timeout}ms (last HTTP status: ${lastStatus ?? "none"}).\n${logs.join("")}`,
 		);
 	}
 

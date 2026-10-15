@@ -97,7 +97,7 @@
       "package_json_hash": "2fb652d470c0afebf88f24dc85eff3015b62505b"
     },
     "ai-brand-visibility-template": {
-      "package_json_hash": "2530208e3b979a69594643809613b7b6c3848edd"
+      "package_json_hash": "868120e72ae9b60d186b4f303d8ddc103393d457"
     },
     "commerce-llms-txt-template": {
       "package_json_hash": "ecaf3267a8bcc62542398f4b02f7b76b775fc926"
@@ -122,6 +122,9 @@
     },
     "grpc-container-template": {
       "package_json_hash": "b77d3053c4e5aee2f7e7b3f5255b7a0dd6301437"
+    },
+    "agentel-network-chat-template": {
+      "package_json_hash": "0c37e8f7788c0989ca4334399df50c9360c97950"
     }
   }
 }

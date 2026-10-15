@@ -40,7 +40,13 @@ function getTestIgnorePatterns(): string[] {
 /**
  * See https://playwright.dev/docs/test-configuration.
  */
+// Opt in explicitly for local CPU emulation; CI and live defaults stay unchanged.
+const slowLocal =
+	process.env.TEMPLATES_SLOW_LOCAL_TESTS === "1" &&
+	process.env.PLAYWRIGHT_USE_LIVE !== "true";
+
 export default defineConfig({
+	expect: { timeout: slowLocal ? 30000 : 5000 },
 	testDir: "./playwright-tests",
 	/* Run tests in files in parallel */
 	fullyParallel: process.env.PLAYWRIGHT_USE_LIVE === "true", // Enable parallel for live URLs
@@ -59,12 +65,26 @@ export default defineConfig({
 		/* Collect trace when retrying the failed test. See https://playwright.dev/docs/trace-viewer */
 		trace: "on-first-retry",
 		/* Increase timeout for template server startup, reduce for live URLs */
-		actionTimeout: process.env.PLAYWRIGHT_USE_LIVE === "true" ? 5000 : 10000,
+		actionTimeout:
+			process.env.PLAYWRIGHT_USE_LIVE === "true"
+				? 5000
+				: slowLocal
+					? 60000
+					: 10000,
 		navigationTimeout:
-			process.env.PLAYWRIGHT_USE_LIVE === "true" ? 15000 : 30000,
+			process.env.PLAYWRIGHT_USE_LIVE === "true"
+				? 15000
+				: slowLocal
+					? 180000
+					: 30000,
 	},
 	/* Global timeout for tests */
-	timeout: process.env.PLAYWRIGHT_USE_LIVE === "true" ? 30000 : 60000,
+	timeout:
+		process.env.PLAYWRIGHT_USE_LIVE === "true"
+			? 30000
+			: slowLocal
+				? 600000
+				: 60000,
 
 	/* Configure projects for major browsers */
 	projects: [
