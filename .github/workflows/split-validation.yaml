@@ -17,9 +17,7 @@ jobs:
       matrix:
         include:
           - candidate: template-only
-            sha: 8a29d25f75ce513dbe5ebc2238b5c216a0d7a1ef
-          - candidate: grpc-only
-            sha: 49c6ecc0f3dc8e6e5a507f95de466f0aee576e8f
+            sha: b500e2a650f78d3a554888e1eb3e21fc88faab86
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
