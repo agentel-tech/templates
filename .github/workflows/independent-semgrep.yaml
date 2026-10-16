@@ -1,0 +1,34 @@
+name: Agentel independent Semgrep audit
+on:
+  push:
+    branches: [ci/agentel-semgrep-20261016]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  semgrep:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      SEMGREP_SEND_METRICS: "off"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 44acfcb153f98677c8ea083e80f74149dfa7ed1e
+          persist-credentials: false
+      - name: Verify source
+        run: test "$(git rev-parse HEAD)" = "44acfcb153f98677c8ea083e80f74149dfa7ed1e"
+      - name: Install upstream-pinned OSS scanner in an isolated environment
+        run: |
+          python3 -m venv "$RUNNER_TEMP/agentel-semgrep"
+          "$RUNNER_TEMP/agentel-semgrep/bin/pip" install semgrep==1.160.0
+      - name: Scan source with upstream auto configuration and JSON evidence
+        run: |
+          "$RUNNER_TEMP/agentel-semgrep/bin/semgrep" --version
+          "$RUNNER_TEMP/agentel-semgrep/bin/semgrep" scan --config=auto --metrics=off --json --output "$RUNNER_TEMP/semgrep-results.json"
+      - name: Retain scanner evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-evidence
+          path: ${{ runner.temp }}/semgrep-results.json
