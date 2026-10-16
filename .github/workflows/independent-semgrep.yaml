@@ -9,8 +9,6 @@ jobs:
   semgrep:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      SEMGREP_SEND_METRICS: "off"
     steps:
       - uses: actions/checkout@v5
         with:
@@ -25,7 +23,7 @@ jobs:
       - name: Scan source with upstream auto configuration and JSON evidence
         run: |
           "$RUNNER_TEMP/agentel-semgrep/bin/semgrep" --version
-          "$RUNNER_TEMP/agentel-semgrep/bin/semgrep" scan --config=auto --metrics=off --json --output "$RUNNER_TEMP/semgrep-results.json"
+          "$RUNNER_TEMP/agentel-semgrep/bin/semgrep" scan --config=auto --json --output "$RUNNER_TEMP/semgrep-results.json"
       - name: Retain scanner evidence
         if: always()
         uses: actions/upload-artifact@v4
