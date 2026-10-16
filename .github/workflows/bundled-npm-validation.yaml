@@ -1,0 +1,68 @@
+name: Agentel standalone bundled npm acceptance
+on:
+  push:
+    branches: [ci/standalone-bundled-npm-20261016]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  standalone:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      WRANGLER_SEND_METRICS: "false"
+      DO_NOT_TRACK: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 44acfcb153f98677c8ea083e80f74149dfa7ed1e
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.23.3"
+      - name: Export only the template into a clean directory
+        run: |
+          test "$(git rev-parse HEAD)" = "44acfcb153f98677c8ea083e80f74149dfa7ed1e"
+          test "$(uname -m)" = x86_64
+          mkdir "$RUNNER_TEMP/agentel-standalone"
+          git archive HEAD:agentel-network-chat-template | tar -x -C "$RUNNER_TEMP/agentel-standalone"
+          mkdir "$RUNNER_TEMP/agentel-standalone-evidence"
+          cd "$RUNNER_TEMP/agentel-standalone"
+          sha256sum package-lock.json > "$RUNNER_TEMP/agentel-lock.before"
+          node --version
+      - name: Install only the template from its committed npm lock
+        working-directory: ${{ runner.temp }}/agentel-standalone
+        run: |
+          npm --version
+          npm ci --cache "$RUNNER_TEMP/agentel-fresh-npm-cache" --no-audit --no-fund
+      - name: Check standalone formatting lint and types
+        working-directory: ${{ runner.temp }}/agentel-standalone
+        run: npm run check
+      - name: Run standalone unit and Worker tests including build
+        working-directory: ${{ runner.temp }}/agentel-standalone
+        run: npm test
+      - name: Assert the npm lock stayed unchanged
+        working-directory: ${{ runner.temp }}/agentel-standalone
+        run: sha256sum --check "$RUNNER_TEMP/agentel-lock.before"
+      - name: Install a pinned external browser harness
+        run: |
+          npm install --prefix "$RUNNER_TEMP/agentel-browser" --no-package-lock --ignore-scripts --no-audit --no-fund @playwright/test@1.57.0
+          node "$RUNNER_TEMP/agentel-browser/node_modules/playwright/cli.js" install --with-deps chromium
+      - name: Run real standalone local UI without Reader or model secrets
+        run: |
+          node <<'NODE'
+          const fs=require('fs'),path=require('path'),cp=require('child_process');
+          const root=path.join(process.env.RUNNER_TEMP,'agentel-standalone');const out=path.join(process.env.RUNNER_TEMP,'agentel-standalone-evidence');fs.mkdirSync(out,{recursive:true});
+          const {chromium}=require(path.join(process.env.RUNNER_TEMP,'agentel-browser/node_modules/playwright'));
+          const log=fs.openSync(path.join(out,'local-server.log'),'w');const proc=cp.spawn(process.execPath,[path.join(root,'node_modules/wrangler/bin/wrangler.js'),'dev','--config','wrangler.e2e.jsonc','--local','--env','e2e','--env-file','test/e2e.vars','--ip','127.0.0.1','--port','18793','--inspector-port','18794'],{cwd:root,env:{...process.env,WRANGLER_SEND_METRICS:'false',DO_NOT_TRACK:'1'},stdio:['ignore',log,log],detached:true});
+          const report={standalone:true,realCredentialsUsed:false,modelTurns:0,businessReadAttempts:0,blockedBrowserOrigins:[]};let browser;
+          (async()=>{try{let ready=false;for(let i=0;i<200;i++){if(proc.exitCode!==null)throw Error('LOCAL_SERVER_EXITED');try{const r=await fetch('http://127.0.0.1:18793',{signal:AbortSignal.timeout(1000)});if(r.status===401){ready=true;break}}catch{}await new Promise(r=>setTimeout(r,300))}if(!ready)throw Error('LOCAL_READY_TIMEOUT');report.unauthenticatedStatus=401;
+          browser=await chromium.launch({headless:true});const context=await browser.newContext({viewport:{width:1600,height:900},httpCredentials:{username:'agentel',password:'synthetic-local-operator-password-20261015'}});const page=await context.newPage();await page.route('**/*',route=>{const u=new URL(route.request().url());if(u.origin==='http://127.0.0.1:18793')return route.continue();report.blockedBrowserOrigins.push(u.origin);return route.abort()});const response=await page.goto('http://127.0.0.1:18793');report.authenticatedStatus=response.status();await page.getByText('Connected',{exact:true}).waitFor({timeout:30000});report.reactAndAgentConnected=true;await page.screenshot({path:path.join(out,'standalone-ui.png')});await page.getByRole('button',{name:/^MCP/}).click();await page.getByRole('button',{name:'Connect / refresh Agentel'}).click();await page.getByText("Check the server's Reader key and scope, then reconnect.").waitFor({timeout:30000});report.missingReaderSafelyReported=true;report.passed=true;
+          }finally{if(browser)await browser.close();try{process.kill(-proc.pid,'SIGTERM')}catch{}fs.closeSync(log);report.serverStopRequested=true;fs.writeFileSync(path.join(out,'browser-readback.json'),JSON.stringify(report,null,2));console.log(JSON.stringify(report))}})().catch(e=>{console.error(e.message);process.exitCode=1});
+          NODE
+      - name: Retain standalone evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: standalone-bundled-evidence
+          path: ${{ runner.temp }}/agentel-standalone-evidence/
